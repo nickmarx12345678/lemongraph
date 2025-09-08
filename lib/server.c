@@ -198,7 +198,7 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 				while(worker) {
 					time_t active_duration = now - worker->active_since;
 					if(active_duration > 60) {  // Log workers active for more than 60 seconds
-						logmsg(LOG_WARNING, "worker(%d) stuck for %ld seconds", worker->fd, (long)active_duration);
+						logmsg(LOG_WARN, "worker(%d) stuck for %ld seconds", worker->fd, (long)active_duration);
 						
 						// Kill workers stuck for more than 5 minutes
 						if(active_duration > 300) {
