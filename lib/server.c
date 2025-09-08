@@ -84,6 +84,7 @@ typedef struct {
 	list_t ls;
 	int fd;
 	char byte;
+	time_t active_since;  // When this worker became active (0 if idle)
 } wc_t;
 
 static int sockd(int *sfds, int nsfds, int sockd_level){
@@ -125,8 +126,10 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 	list_init(workers_active);
 
 	int i, one = 1;
-	for(i = 0; i < max; i++)
+	for(i = 0; i < max; i++){
+		cfds[i].active_since = 0;  // Initialize as idle
 		list_push(spare, cfds + i, 0);
+	}
 
 	for(i = 0; i < nsfds; i++)
 		ioctl(sfds[i], FIONBIO, &one);
@@ -185,6 +188,49 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 
 			logmsg(LOG_INFO, "status: workers_idle=%d workers_active=%d conn_idle=%d conn_ready=%d avail=%d nworkers=%d listening=%d",
 				   workers_idle_count, workers_active_count, conn_idle_count, conn_ready_count, avail, nworkers, listening);
+			
+			// Log details about stuck workers and kill those stuck too long
+			if(workers_active_count > 0) {
+				worker = list_peek(workers_active, 0);
+				wc_t *stuck_workers[workers_active_count];
+				int stuck_count = 0;
+				
+				while(worker) {
+					time_t active_duration = now - worker->active_since;
+					if(active_duration > 60) {  // Log workers active for more than 60 seconds
+						logmsg(LOG_WARNING, "worker(%d) stuck for %ld seconds", worker->fd, (long)active_duration);
+						
+						// Kill workers stuck for more than 5 minutes
+						if(active_duration > 300) {
+							stuck_workers[stuck_count++] = worker;
+						}
+					}
+					worker = list_next(workers_active, worker, 0);
+					if(worker) worker = list_next(workers_active, worker, 0); // skip conn part
+				}
+				
+				// Remove stuck workers - NOTE: This only closes sockets, not processes
+				// The actual worker processes will become zombies and need cleanup
+				for(int j = 0; j < stuck_count; j++) {
+					worker = stuck_workers[j];
+					conn = list_next(workers_active, worker, 0);
+					if(conn) {
+						logmsg(LOG_ERROR, "abandoning stuck worker socket(%d) after %ld seconds - process may still be running", 
+							   worker->fd, (long)(now - worker->active_since));
+						list_remove(workers_active, worker);
+						list_remove(workers_active, conn);
+						list_push(spare, worker, 0);
+						close(worker->fd);  // Only closes socket, worker process continues
+						nworkers--;
+						avail++;
+						// Close the connection too
+						list_push(spare, conn, 0);
+						close(conn->fd);
+						avail++;
+					}
+				}
+			}
+			
 			last_status_log = now;
 		}
 
@@ -263,6 +309,7 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 					logmsg(LOG_DEBUG, "worker_add(%d) => %d", worker->fd, ++nworkers);
 					avail--;
 				}else if(0 == r || EINTR != errno){
+					logmsg(LOG_INFO, "no more workers available from master (xfd_recv returned %d, errno=%d)", r, errno);
 					listening = 0;
 				}
 			}
@@ -312,6 +359,7 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 					logmsg(LOG_DEBUG, "worker_del(%d) => %d", worker->fd, --nworkers);
 					avail++;
 				}else{
+					worker->active_since = 0;  // Clear timestamp when returning to idle
 					list_push(workers_idle, worker, 0);
 				}
 				if(conn->byte & 1){
@@ -353,6 +401,16 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 		}
 //		pfd += poll_idle;
 		worker = list_peek(workers_idle, 0);
+		if(!worker && !list_empty(conn_ready)) {
+			// Count ready connections
+			int ready_count = 0;
+			conn = list_peek(conn_ready, 0);
+			while(conn) {
+				ready_count++;
+				conn = list_next(conn_ready, conn, 0);
+			}
+			logmsg(LOG_DEBUG, "no idle workers available for %d ready connections", ready_count);
+		}
 		while(worker){
 			conn = list_peek(conn_ready, 0);
 			if(!conn)
@@ -364,6 +422,7 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 				}while(-1 == r && EINTR == errno);
 				if(1 == r){
 					logmsg(LOG_DEBUG, "conn(%d) => worker(%d)", conn->fd, worker->fd);
+					worker->active_since = time(NULL);  // Mark when worker became active
 					list_remove(workers_idle, worker);
 					list_remove(conn_ready, conn);
 					list_push(workers_active, worker, 1);
@@ -371,6 +430,8 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 					break;
 				}
 //				assert(-1 == r && EPIPE == errno);
+				logmsg(LOG_DEBUG, "worker(%d) failed to accept work (xfd_send returned %zd, errno=%d)", 
+					   worker->fd, r, errno);
 				list_remove(workers_idle, worker);
 				list_push(spare, worker, 0);
 				close(worker->fd);
