@@ -13,6 +13,7 @@
 #include<sys/un.h>
 #include<sys/wait.h>
 #include<unistd.h>
+#include<time.h> // Added for time()
 
 #include"server.h"
 #include"logging.h"
@@ -137,9 +138,55 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 	int poll_active;
 	int poll_idle;
 	wc_t *worker, *conn, *next;
+
+	// Status logging variables
+	time_t last_status_log = 0;
+	const int STATUS_LOG_INTERVAL = 30; // Log status every 30 seconds
+
 	while(listening || !list_empty(workers_active)){
 		pfd = pfds;
 		poll_master = poll_accept = poll_active = poll_idle = 0;
+
+		// Log status periodically
+		time_t now = time(NULL);
+		if (now - last_status_log >= STATUS_LOG_INTERVAL) {
+			// Count workers_idle
+			int workers_idle_count = 0;
+			worker = list_peek(workers_idle, 0);
+			while(worker) {
+				workers_idle_count++;
+				worker = list_next(workers_idle, worker, 0);
+			}
+
+			// Count workers_active (pairs of worker+conn)
+			int workers_active_count = 0;
+			worker = list_peek(workers_active, 0);
+			while(worker) {
+				workers_active_count++;
+				worker = list_next(workers_active, worker, 0);
+				if(worker) worker = list_next(workers_active, worker, 0); // skip conn part
+			}
+
+			// Count conn_idle
+			int conn_idle_count = 0;
+			conn = list_peek(conn_idle, 0);
+			while(conn) {
+				conn_idle_count++;
+				conn = list_next(conn_idle, conn, 0);
+			}
+
+			// Count conn_ready
+			int conn_ready_count = 0;
+			conn = list_peek(conn_ready, 0);
+			while(conn) {
+				conn_ready_count++;
+				conn = list_next(conn_ready, conn, 0);
+			}
+
+			logmsg(LOG_INFO, "status: workers_idle=%d workers_active=%d conn_idle=%d conn_ready=%d avail=%d nworkers=%d listening=%d",
+				   workers_idle_count, workers_active_count, conn_idle_count, conn_ready_count, avail, nworkers, listening);
+			last_status_log = now;
+		}
 
 		if(avail && listening){
 			// look for new workers

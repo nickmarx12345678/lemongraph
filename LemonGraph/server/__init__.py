@@ -1236,32 +1236,67 @@ class _LG_Tasky(Handler, _Streamy):
         return task.status, chains
 
     def stream_job_task(self, job_uuid, priority=None, meta=None, touch=False, **kwargs):
+        worker_id = os.getpid()
+        start_time = time.time()
+        log.info('worker(%d): stream_job_task start job_uuid=%s kwargs=%s', worker_id, job_uuid, kwargs)
+
+        graph_open_start = time.time()
         with self.graph(job_uuid, create=False) as g:
+            graph_open_time = time.time() - graph_open_start
+            log.debug('worker(%d): stream_job_task graph opened (time=%.3fs)', worker_id, graph_open_time)
+
+            txn_start = time.time()
             with g.transaction(write=True) as txn:
+                txn_open_time = time.time() - txn_start
+                log.debug('worker(%d): stream_job_task transaction opened (time=%.3fs)', worker_id, txn_open_time)
+
                 try:
+                    task_lookup_start = time.time()
                     task = txn.lg_lite.task(**kwargs)
+                    task_lookup_time = time.time() - task_lookup_start
+                    log.debug('worker(%d): stream_job_task task found (time=%.3fs)', worker_id, task_lookup_time)
                 except IndexError:
                     # kicks us out of the txn 'with' block
+                    commit_start = time.time()
                     txn.commit()
+                    commit_time = time.time() - commit_start
+                    total_time = time.time() - start_time
+                    log.warning('worker(%d): stream_job_task no task found, committed empty txn (commit_time=%.3fs, total_time=%.3fs)',
+                               worker_id, commit_time, total_time)
 
+                update_start = time.time()
                 task.update(touch=touch)
+                update_time = time.time() - update_start
+                log.debug('worker(%d): stream_job_task task updated (time=%.3fs)', worker_id, update_time)
+
                 location = '/lg/task/%s/%s' % (job_uuid, task.uuid)
                 self.res.headers.set('Location', location)
                 status = task.status
                 status['location'] = location
                 status['uuid'] = job_uuid
                 if meta:
+                    meta_start = time.time()
                     status['meta'] = m = {}
                     for k in meta:
                         try:
                             m[k] = txn[k]
                         except KeyError:
                             pass
+                    meta_time = time.time() - meta_start
+                    log.debug('worker(%d): stream_job_task meta collected (time=%.3fs)', worker_id, meta_time)
                 if priority is not None:
                     self.res.headers.set('X-lg-priority', str(priority))
+
+                stream_start = time.time()
                 for chunk in self.stream([status], task.format()):
                     yield chunk
+                stream_time = time.time() - stream_start
+                total_time = time.time() - start_time
+                log.info('worker(%d): stream_job_task completed (stream_time=%.3fs, total_time=%.3fs)',
+                        worker_id, stream_time, total_time)
                 return
+        total_time = time.time() - start_time
+        log.warning('worker(%d): stream_job_task raising IndexError (total_time=%.3fs)', worker_id, total_time)
         raise IndexError
 
 class LG__Adapter(_Params, _LG_Tasky):
@@ -1269,28 +1304,58 @@ class LG__Adapter(_Params, _LG_Tasky):
     offset = 2
 
     def get_task(self, adapter, query, uuid=(), **kwargs):
+        worker_id = os.getpid()
+        start_time = time.time()
+        log.info('worker(%d): get_task start adapter=%s query=%s uuid=%s kwargs=%s',
+                worker_id, adapter, query, uuid, kwargs)
+
         if uuid:
             uuid = (x for x in uuid if isinstance(x, str) and UUID.match(x))
             for job_uuid in uuid:
                 try:
+                    log.debug('worker(%d): get_task trying specific job_uuid=%s', worker_id, job_uuid)
+                    task_start = time.time()
                     for x in self.stream_job_task(job_uuid, adapter=adapter, query=query, **kwargs):
                         yield x
+                    task_time = time.time() - task_start
+                    log.info('worker(%d): get_task completed specific job_uuid=%s (time=%.3fs)',
+                            worker_id, job_uuid, task_time)
                     return
-                except (IndexError, HTTPError):
+                except (IndexError, HTTPError) as e:
+                    log.debug('worker(%d): get_task failed for job_uuid=%s: %s', worker_id, job_uuid, e)
                     pass
+            total_time = time.time() - start_time
+            log.warning('worker(%d): get_task no valid job_uuid found (time=%.3fs)', worker_id, total_time)
             return
 
+        log.debug('worker(%d): get_task looking up jobs in collection', worker_id)
+        collection_start = time.time()
         with self.collection.context(write=False) as ctx:
             try:
                 jobs = ctx.lg_lite_index.jobs(adapter, query)
-            except KeyError:
+            except KeyError as e:
+                total_time = time.time() - start_time
+                log.warning('worker(%d): get_task no jobs found for adapter=%s query=%s (time=%.3fs)',
+                           worker_id, adapter, query, total_time)
                 raise IndexError
             cursor = jobs.cursor()
             job_uuid, pri = cursor.next(ctx.txn)
+        collection_time = time.time() - collection_start
+        log.debug('worker(%d): get_task found job_uuid=%s priority=%s (collection_time=%.3fs)',
+                 worker_id, job_uuid, pri, collection_time)
+
         while True:
             try:
+                log.debug('worker(%d): get_task processing job_uuid=%s', worker_id, job_uuid)
+                task_start = time.time()
                 for x in self.stream_job_task(job_uuid, adapter=adapter, query=query, priority=pri, **kwargs):
                     yield x
+                task_time = time.time() - task_start
+                total_time = time.time() - start_time
+                log.info('worker(%d): get_task completed job_uuid=%s (task_time=%.3fs, total_time=%.3fs)',
+                        worker_id, job_uuid, task_time, total_time)
+
+                requeue_start = time.time()
                 with self.collection.context(write=True) as ctx:
                     try:
                         # re-add job w/ it's current priority, which
@@ -1299,21 +1364,40 @@ class LG__Adapter(_Params, _LG_Tasky):
                         jobs.add(job_uuid, priority=jobs[job_uuid])
                     except KeyError:
                         pass
+                requeue_time = time.time() - requeue_start
+                log.debug('worker(%d): get_task requeued job_uuid=%s (requeue_time=%.3fs)',
+                         worker_id, job_uuid, requeue_time)
                 return
-            except (IndexError, HTTPError):
+            except (IndexError, HTTPError) as e:
+                log.debug('worker(%d): get_task failed for job_uuid=%s: %s', worker_id, job_uuid, e)
                 pass
+
+            next_start = time.time()
             with self.collection.context(write=False) as ctx:
                 job_uuid, pri = cursor.next(ctx.txn)
+            next_time = time.time() - next_start
+            log.debug('worker(%d): get_task next job_uuid=%s priority=%s (next_time=%.3fs)',
+                     worker_id, job_uuid, pri, next_time)
 
     def next_query(self, adapter):
+        worker_id = os.getpid()
+        log.debug('worker(%d): next_query adapter=%s', worker_id, adapter)
+        start_time = time.time()
         with self.collection.context(write=True) as ctx:
             try:
-                return ctx.lg_lite_index.queries(adapter).next()
-            except (KeyError, IndexError):
+                result = ctx.lg_lite_index.queries(adapter).next()
+                query_time = time.time() - start_time
+                log.debug('worker(%d): next_query found query=%s (time=%.3fs)', worker_id, result, query_time)
+                return result
+            except (KeyError, IndexError) as e:
+                query_time = time.time() - start_time
+                log.debug('worker(%d): next_query no queries found (time=%.3fs): %s', worker_id, query_time, e)
                 pass
         raise IndexError
 
     def queries(self, adapter):
+        worker_id = os.getpid()
+        log.debug('worker(%d): queries adapter=%s', worker_id, adapter)
         seen = set()
         try:
             query = self.next_query(adapter)
@@ -1322,26 +1406,51 @@ class LG__Adapter(_Params, _LG_Tasky):
                 yield query
                 query = self.next_query(adapter)
         except IndexError:
+            log.debug('worker(%d): queries exhausted for adapter=%s', worker_id, adapter)
             pass
 
     def _get_post(self, adapter):
+        worker_id = os.getpid()
+        start_time = time.time()
+        log.info('worker(%d): _get_post start adapter=%s', worker_id, adapter)
+
+        input_start = time.time()
         data = self.input() or {}
+        input_time = time.time() - input_start
+        log.debug('worker(%d): _get_post input parsed (time=%.3fs)', worker_id, input_time)
+
         params = self.merge_params(input=data,
             single={'limit': cast.uint, 'timeout': cast.unum },
             multi=('query', 'ignore', 'meta', 'uuid'))
+        log.debug('worker(%d): _get_post params=%s', worker_id, params)
 
+        query_lookup_start = time.time()
         queries = set(params.pop('query', [])) or self.queries(adapter)
+        query_lookup_time = time.time() - query_lookup_start
+        log.debug('worker(%d): _get_post found %d queries (time=%.3fs)',
+                 worker_id, len(queries) if isinstance(queries, set) else 0, query_lookup_time)
+
         try:
             for query in queries:
                 try:
+                    log.info('worker(%d): _get_post processing query=%s', worker_id, query)
+                    query_start = time.time()
                     for x in self.get_task(adapter, query, touch=True, **params):
                         yield x
+                    query_time = time.time() - query_start
+                    total_time = time.time() - start_time
+                    log.info('worker(%d): _get_post completed query=%s (query_time=%.3fs, total_time=%.3fs)',
+                            worker_id, query, query_time, total_time)
                     return
-                except IndexError:
+                except IndexError as e:
+                    log.debug('worker(%d): _get_post no task for query=%s: %s', worker_id, query, e)
                     pass
         finally:
             if not isinstance(queries, set):
                 queries.close()
+            total_time = time.time() - start_time
+            log.info('worker(%d): _get_post finished adapter=%s (total_time=%.3fs)',
+                    worker_id, adapter, total_time)
 
     get  = _get_post
     post = _get_post

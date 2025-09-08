@@ -13,6 +13,7 @@ import sys
 import time
 import traceback
 import zlib
+import uuid
 
 from . import ffi, lib, wire
 
@@ -278,54 +279,111 @@ class Service(object):
         w = lib.lg_worker_new(wsock)
         byte = ffi.buffer(ffi.addressof(w, 'byte'), 1)
         go = True
+        worker_id = os.getpid()
+        request_count = 0
+
+        log.info('worker(%d): started, max_requests=%d', worker_id, self.maxreqs)
+
         while go:
+            log.debug('worker(%d): waiting for connection', worker_id)
+            start_accept = time.time()
             r = lib.lg_worker_accept(w)
+            accept_time = time.time() - start_accept
+
             if 0 == r:
+                log.info('worker(%d): shutdown signal received', worker_id)
                 return
             elif -1 == r:
+                log.debug('worker(%d): accept interrupted', worker_id)
                 continue
+
+            request_count += 1
+            request_id = str(uuid.uuid4())[:8]  # Short request ID for correlation
             conn = BufferedSocket(socket.fromfd(w.conn, w.family, w.type, w.proto), byte[:])
             addr = conn.getpeername() or ('UNIX', 0)
-            log.debug('client %s:%d: connected', *addr)
+
+            log.info('worker(%d): req#%d [%s] client %s:%d connected (accept_time=%.3fs)',
+                    worker_id, request_count, request_id, addr[0], addr[1], accept_time)
+
+            request_start = time.time()
             try:
                 while go:
                     self.maxreqs -= 1
                     res = Response(conn)
+
+                    log.debug('worker(%d): req#%d [%s] starting request processing', worker_id, request_count, request_id)
+
                     try:
                         try:
+                            req_parse_start = time.time()
                             req = Request(conn, res, timeout=self.timeout)
+                            req_parse_time = time.time() - req_parse_start
+
+                            log.info('worker(%d): req#%d [%s] %s %s (parse_time=%.3fs)',
+                                    worker_id, request_count, request_id, req.method, req.path, req_parse_time)
+
+                            process_start = time.time()
                             self.process(req, res)
+                            process_time = time.time() - process_start
+
+                            log.info('worker(%d): req#%d [%s] processing completed (process_time=%.3fs)',
+                                    worker_id, request_count, request_id, process_time)
+
                         except HTTPError as e:
+                            process_time = time.time() - process_start if 'process_start' in locals() else 0
                             if e.code >= 500:
-                                log.error('HTTP error %s', e)
+                                log.error('worker(%d): req#%d [%s] HTTP error %s (process_time=%.3fs)',
+                                         worker_id, request_count, request_id, e, process_time)
                             elif e.code >= 400:
-                                log.info('HTTP error %s', e)
+                                log.info('worker(%d): req#%d [%s] HTTP error %s (process_time=%.3fs)',
+                                        worker_id, request_count, request_id, e, process_time)
                             res.error(e.code, e.message, *e.headers)
                     except ErrorCompleted:
                         pass
+
                     ended = time.time()
-                    log.debug('response/finished ms: %d/%d', res.delay_ms, int((ended - res.start) * 1000))
+                    total_time = ended - request_start
+                    log.info('worker(%d): req#%d [%s] response/finished ms: %d/%d (total_time=%.3fs)',
+                            worker_id, request_count, request_id, res.delay_ms, int((ended - res.start) * 1000), total_time)
+
                     code = keepalive = 'HTTP/1.1' == req.version and not res.headers.contains('Connection', 'close')
                     if keepalive and conn:
+                        log.debug('worker(%d): req#%d [%s] keeping connection alive', worker_id, request_count, request_id)
                         continue
                     go = self.maxreqs > 0
                     if not go:
                         code |= 2
+                        log.info('worker(%d): req#%d [%s] max requests reached, worker exiting', worker_id, request_count, request_id)
+
+                    finish_start = time.time()
                     lib.lg_worker_finish(w, code)
+                    finish_time = time.time() - finish_start
+                    log.debug('worker(%d): req#%d [%s] finished (finish_time=%.3fs)',
+                             worker_id, request_count, request_id, finish_time)
                     break
+
             except Disconnected as e:
+                total_time = time.time() - request_start
+                log.warning('worker(%d): req#%d [%s] client disconnected: %s (total_time=%.3fs)',
+                           worker_id, request_count, request_id, e, total_time)
                 lib.lg_worker_finish(w, 0)
             except socket.timeout:
-                log.warning('client %s:%d: timed out', *addr)
+                total_time = time.time() - request_start
+                log.warning('worker(%d): req#%d [%s] client %s:%d timed out (total_time=%.3fs)',
+                           worker_id, request_count, request_id, addr[0], addr[1], total_time)
                 lib.lg_worker_finish(w, 0)
             except Exception as e:
+                total_time = time.time() - request_start
                 info = sys.exc_info()
                 trace = ''.join(traceback.format_exception(*info))
-                log.error('Unhandled exception: %s', trace)
+                log.error('worker(%d): req#%d [%s] unhandled exception (total_time=%.3fs): %s',
+                         worker_id, request_count, request_id, total_time, trace)
                 os._exit(1)
             finally:
                 conn.close()
-                log.debug('client %s:%d: finished', *addr)
+                total_time = time.time() - request_start
+                log.info('worker(%d): req#%d [%s] client %s:%d finished (total_time=%.3fs)',
+                        worker_id, request_count, request_id, addr[0], addr[1], total_time)
 
     def process(self, req, res):
         cursor = self.root
