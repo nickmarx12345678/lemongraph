@@ -1,0 +1,45 @@
+#!/bin/bash
+# Script to dump stack traces from LemonGraph workers
+# Usage: ./dump_worker_stacks [signal] [pid...]
+#
+# Signals:
+#   USR1 - Dump stack trace without killing worker (default)
+#   USR2 - Dump stack trace without killing worker  
+#   TERM - Dump stack trace and kill worker
+#   INT  - Dump stack trace and kill worker
+
+SIGNAL=${1:-USR1}
+shift
+
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 [USR1|USR2|TERM|INT] <worker_pid> [worker_pid...]"
+    echo ""
+    echo "Find worker PIDs with:"
+    echo "  ps aux | grep -E 'LemonGraph|lemongraph' | grep -v grep"
+    echo ""
+    echo "Examples:"
+    echo "  $0 USR1 12345           # Dump stack trace for worker 12345 (non-fatal)"
+    echo "  $0 TERM 12345 12346     # Dump stack traces and kill workers 12345 and 12346"
+    echo "  $0 12345                # Dump stack trace for worker 12345 (USR1, non-fatal)"
+    exit 1
+fi
+
+echo "Sending SIG${SIGNAL} to worker processes..."
+
+for pid in "$@"; do
+    if kill -0 "$pid" 2>/dev/null; then
+        echo "Sending SIG${SIGNAL} to worker $pid"
+        kill -"$SIGNAL" "$pid"
+        if [ "$SIGNAL" = "USR1" ] || [ "$SIGNAL" = "USR2" ]; then
+            echo "  -> Stack trace dumped (worker still running)"
+        else
+            echo "  -> Stack trace dumped and worker terminated"
+        fi
+    else
+        echo "Worker $pid not found or not accessible"
+    fi
+done
+
+echo ""
+echo "Check your LemonGraph logs for stack trace output."
+echo "Look for lines containing 'dumping stack traces' and 'Stack trace dump complete'"

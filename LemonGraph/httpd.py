@@ -17,6 +17,54 @@ import uuid
 
 from . import ffi, lib, wire
 
+def dump_stack_trace(signum, frame):
+    """Signal handler to dump stack trace when worker receives termination signal"""
+    import threading
+    
+    signal_names = {
+        signal.SIGTERM: 'SIGTERM',
+        signal.SIGINT: 'SIGINT', 
+        signal.SIGUSR1: 'SIGUSR1',
+        signal.SIGUSR2: 'SIGUSR2'
+    }
+    
+    signal_name = signal_names.get(signum, f'Signal {signum}')
+    worker_id = os.getpid()
+    
+    log = logging.getLogger('LemonGraph.httpd')
+    log.error('=' * 80)
+    log.error('worker(%d): Received %s - dumping stack traces for all threads', worker_id, signal_name)
+    log.error('=' * 80)
+    
+    # Get all thread stack traces
+    for thread_id, thread_frame in sys._current_frames().items():
+        thread_name = 'Unknown'
+        for thread in threading.enumerate():
+            if thread.ident == thread_id:
+                thread_name = thread.name
+                break
+                
+        log.error('Thread %d (%s):', thread_id, thread_name)
+        log.error('-' * 40)
+        
+        # Format the stack trace
+        stack_lines = traceback.format_stack(thread_frame)
+        for line in stack_lines:
+            # Remove trailing newlines and log each line
+            for subline in line.rstrip().split('\n'):
+                if subline.strip():
+                    log.error('  %s', subline)
+        log.error('')
+    
+    log.error('=' * 80)
+    log.error('worker(%d): Stack trace dump complete', worker_id)
+    log.error('=' * 80)
+    
+    # If this was SIGTERM or SIGINT, exit after dumping
+    if signum in (signal.SIGTERM, signal.SIGINT):
+        log.error('worker(%d): Exiting due to %s', worker_id, signal_name)
+        sys.exit(1)
+
 try:
     import ujson
     def json_encode(x):
@@ -282,7 +330,13 @@ class Service(object):
         worker_id = os.getpid()
         request_count = 0
 
-        log.info('worker(%d): started, max_requests=%d', worker_id, self.maxreqs)
+        # Set up signal handlers for stack trace dumping
+        signal.signal(signal.SIGTERM, dump_stack_trace)
+        signal.signal(signal.SIGINT, dump_stack_trace)
+        signal.signal(signal.SIGUSR1, dump_stack_trace)  # Non-fatal stack dump
+        signal.signal(signal.SIGUSR2, dump_stack_trace)  # Non-fatal stack dump
+
+        log.info('worker(%d): started, max_requests=%d (signal handlers installed)', worker_id, self.maxreqs)
 
         while go:
             log.debug('worker(%d): waiting for connection', worker_id)
