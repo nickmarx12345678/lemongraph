@@ -17,7 +17,11 @@ import zlib
 from . import ffi, lib, wire
 
 def dump_stack_trace(signum, frame):
-    """Signal handler to dump stack trace when worker receives termination signal"""
+    """Signal handler to dump stack trace when worker receives termination signal
+
+    Example, where process_id is the pid of a LG worker:
+    kill -s USR1 <process_id>
+    """
     import threading
 
     signal_names = {
