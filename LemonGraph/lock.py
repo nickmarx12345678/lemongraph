@@ -1,5 +1,9 @@
+import logging
 import os
 import fcntl
+import time
+
+log = logging.getLogger(__name__)
 
 class Lock(object):
     _close = os.close
@@ -80,13 +84,22 @@ class Ctx(object):
     def _update(self, mode):
         if mode is None:
             if self.locked:
+                log.debug('lock: releasing offsets=%s pid=%d', self.locks, os.getpid())
                 fcntl.lockf(self.fd, fcntl.LOCK_UN)
                 self.locked = False
         elif self.mode is not mode or not self.locked:
             self.mode = mode
+            kind = 'exclusive' if mode == fcntl.LOCK_EX else 'shared'
+            log.info('lock: acquiring %s offsets=%s pid=%d', kind, self.locks, os.getpid())
+            t0 = time.monotonic()
             self.locked = True
             for offset in self.locks:
                 fcntl.lockf(self.fd, self.mode, 1, offset)
+            elapsed = time.monotonic() - t0
+            if elapsed > 0.1:
+                log.warning('lock: acquired %s offsets=%s pid=%d took %.3fs', kind, self.locks, os.getpid(), elapsed)
+            else:
+                log.info('lock: acquired %s offsets=%s pid=%d took %.3fs', kind, self.locks, os.getpid(), elapsed)
 
     def shared(self):
         self._update(fcntl.LOCK_SH)

@@ -101,6 +101,9 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 	int avail = max - pack_fds(sfds, nsfds, max);
 	int nworkers = 0;
 
+	// list size counters for diagnostics
+	int n_conn_idle = 0, n_conn_ready = 0, n_workers_idle = 0, n_workers_active = 0;
+
 	logmsg(LOG_INFO, "max workers/connections: %d", avail);
 
 	// 32 (x86_64) or 24 (x86) bytes per fd
@@ -136,10 +139,12 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 	int poll_accept;
 	int poll_active;
 	int poll_idle;
+	unsigned long long loop_iter = 0;
 	wc_t *worker, *conn, *next;
 	while(listening || !list_empty(workers_active)){
 		pfd = pfds;
 		poll_master = poll_accept = poll_active = poll_idle = 0;
+		loop_iter++;
 
 		if(avail && listening){
 			// look for new workers
@@ -162,8 +167,11 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 				logmsg(LOG_DEBUG, "conn_close(%d)", conn->fd);
 				close(conn->fd);
 				avail++;
+				n_conn_idle--;
 				conn = list_pop(conn_idle, 0);
 			}
+		}else{
+			logmsg(LOG_WARN, "loop[%llu]: skipping poll_master/poll_accept: avail=%d listening=%d", loop_iter, avail, listening);
 		}
 
 		// look for completed or dead workers
@@ -195,10 +203,32 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 		if(pfd == pfds)
 			break;
 
-		// poll on the collected fds
+		int nfds_total = (int)(pfd - pfds);
+
+		// state summary before poll (every iteration at DEBUG, every 100th or when stuck at INFO)
+		if(loop_iter % 100 == 1 || n_conn_ready > 0 || (n_workers_idle > 0 && n_conn_idle > 0)){
+			logmsg(LOG_INFO, "loop[%llu]: PRE-POLL nfds=%d poll_master=%d poll_accept=%d poll_active=%d poll_idle=%d | avail=%d nworkers=%d idle=%d active=%d conn_idle=%d conn_ready=%d",
+				loop_iter, nfds_total, poll_master, poll_accept, poll_active, poll_idle,
+				avail, nworkers, n_workers_idle, n_workers_active, n_conn_idle, n_conn_ready);
+		}
+
+		// use 30s timeout instead of infinite so we get periodic heartbeat logs
 		do{
-			n = poll(pfds, pfd - pfds, -1);
-		}while(n < 1);
+			n = poll(pfds, nfds_total, 30000);
+		}while(n == -1 && errno == EINTR);
+
+		if(n == 0){
+			// timeout: log heartbeat
+			logmsg(LOG_INFO, "loop[%llu]: HEARTBEAT (30s poll timeout) avail=%d nworkers=%d idle=%d active=%d conn_idle=%d conn_ready=%d listening=%d",
+				loop_iter, avail, nworkers, n_workers_idle, n_workers_active, n_conn_idle, n_conn_ready, listening);
+			continue;
+		}
+		if(n < 0){
+			logmsg(LOG_ERROR, "loop[%llu]: poll error: %s", loop_iter, strerror(errno));
+			break;
+		}
+
+		logmsg(LOG_DEBUG, "loop[%llu]: poll returned n=%d", loop_iter, n);
 
 		pfd = pfds;
 
@@ -213,9 +243,12 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 				if(1 == r){
 					list_remove(spare, worker);
 					list_push(workers_idle, worker, 1);
-					logmsg(LOG_DEBUG, "worker_add(%d) => %d", worker->fd, ++nworkers);
+					++nworkers;
+					n_workers_idle++;
+					logmsg(LOG_INFO, "worker_add(%d) => nworkers=%d idle=%d", worker->fd, nworkers, n_workers_idle);
 					avail--;
 				}else if(0 == r || EINTR != errno){
+					logmsg(LOG_INFO, "master channel closed: r=%d errno=%d", r, errno);
 					listening = 0;
 				}
 			}
@@ -234,7 +267,10 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 					ioctl(conn->fd, FIONBIO, &one);
 					list_remove(spare, conn);
 					list_push(conn_idle, conn, 1);
+					n_conn_idle++;
 					avail--;
+				}else{
+					logmsg(LOG_WARN, "accept(%d) failed: %s", pfd->fd, strerror(errno));
 				}
 			}
 		}
@@ -257,19 +293,24 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 					continue;
 				list_remove(workers_active, worker);
 				list_remove(workers_active, conn);
+				n_workers_active--;
 				if(0 == r)
 					conn->byte = 2;
 				if(conn->byte & 2){
 					list_push(spare, worker, 0);
 					close(worker->fd);
-					logmsg(LOG_DEBUG, "worker_del(%d) => %d", worker->fd, --nworkers);
+					--nworkers;
+					logmsg(LOG_INFO, "worker_del(%d) => nworkers=%d (byte=0x%02x)", worker->fd, nworkers, (unsigned char)conn->byte);
 					avail++;
 				}else{
 					list_push(workers_idle, worker, 0);
+					n_workers_idle++;
+					logmsg(LOG_INFO, "worker_done(%d) => idle=%d (byte=0x%02x)", worker->fd, n_workers_idle, (unsigned char)conn->byte);
 				}
 				if(conn->byte & 1){
 					logmsg(LOG_DEBUG, "conn_idle(%d)", conn->fd);
 					list_push(conn_idle, conn, 1);
+					n_conn_idle++;
 				}else{
 					logmsg(LOG_DEBUG, "conn_close(%d)", conn->fd);
 					list_push(spare, conn, 0);
@@ -288,24 +329,35 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 			next = list_next(conn_idle, conn, 0);
 			if(pfd->revents){
 				n--;
+				logmsg(LOG_DEBUG, "conn_idle(%d) revents=0x%x", conn->fd, pfd->revents);
 				ssize_t r = recv(conn->fd, &conn->byte, 1, 0);
 				if(1 == r){
 					// move to ready
 					list_remove(conn_idle, conn);
+					n_conn_idle--;
 					list_push(conn_ready, conn, 1);
-					logmsg(LOG_DEBUG, "conn_ready(%d)", conn->fd);
+					n_conn_ready++;
+					logmsg(LOG_INFO, "conn_ready(%d) byte=0x%02x conn_idle=%d conn_ready=%d", conn->fd, (unsigned char)conn->byte, n_conn_idle, n_conn_ready);
 				}else if(0 == r || (EINTR != errno && EAGAIN != errno && EWOULDBLOCK != errno)){
 					// close on eof or error
 					list_remove(conn_idle, conn);
+					n_conn_idle--;
 					list_push(spare, conn, 0);
-					logmsg(LOG_DEBUG, "conn_close(%d)", conn->fd);
+					logmsg(LOG_DEBUG, "conn_close(%d) r=%zd errno=%d", conn->fd, r, errno);
 					close(conn->fd);
 					avail++;
+				}else{
+					logmsg(LOG_DEBUG, "conn_idle(%d) recv: r=%zd errno=%d (retry)", conn->fd, r, errno);
 				}
 			}
 		}
 //		pfd += poll_idle;
+
+		// dispatch: match idle workers with ready connections
 		worker = list_peek(workers_idle, 0);
+		if(n_conn_ready > 0 && !worker){
+			logmsg(LOG_WARN, "loop[%llu]: STALL conn_ready=%d but workers_idle=0 (nworkers=%d active=%d)", loop_iter, n_conn_ready, nworkers, n_workers_active);
+		}
 		while(worker){
 			conn = list_peek(conn_ready, 0);
 			if(!conn)
@@ -316,21 +368,32 @@ static int sockd(int *sfds, int nsfds, int sockd_level){
 					r = xfd_send(worker->fd, conn->fd, &conn->byte);
 				}while(-1 == r && EINTR == errno);
 				if(1 == r){
-					logmsg(LOG_DEBUG, "conn(%d) => worker(%d)", conn->fd, worker->fd);
+					logmsg(LOG_INFO, "dispatch: conn(%d) => worker(%d) conn_ready=%d idle=%d", conn->fd, worker->fd, n_conn_ready - 1, n_workers_idle - 1);
 					list_remove(workers_idle, worker);
+					n_workers_idle--;
 					list_remove(conn_ready, conn);
+					n_conn_ready--;
 					list_push(workers_active, worker, 1);
 					list_push(workers_active, conn, 1);
+					n_workers_active++;
 					break;
 				}
-//				assert(-1 == r && EPIPE == errno);
+				logmsg(LOG_WARN, "dispatch: xfd_send to worker(%d) failed: r=%zd errno=%d (%s)", worker->fd, r, errno, strerror(errno));
 				list_remove(workers_idle, worker);
+				n_workers_idle--;
 				list_push(spare, worker, 0);
 				close(worker->fd);
-				logmsg(LOG_DEBUG, "worker_del(%d) => %d", worker->fd, --nworkers);
+				--nworkers;
+				logmsg(LOG_WARN, "worker_del(%d) => nworkers=%d (send failed)", worker->fd, nworkers);
 				avail++;
 			}
 			worker = list_peek(workers_idle, 0);
+		}
+
+		// post-iteration state summary
+		if(n_conn_ready > 0 || n_workers_active > 0){
+			logmsg(LOG_INFO, "loop[%llu]: POST avail=%d nworkers=%d idle=%d active=%d conn_idle=%d conn_ready=%d",
+				loop_iter, avail, nworkers, n_workers_idle, n_workers_active, n_conn_idle, n_conn_ready);
 		}
 	}
 	worker = list_pop(workers_idle, 0);

@@ -86,3 +86,37 @@ Jobs themselves are created/updated/deleted via the older `/graph` endpoint, and
 	* _error_ - set manually to indicate task processing encountered an error
 	* _void_ - set manually to indicate task is ignored
 	* _deleted_ - pseudostate, set manually to delete task from job
+
+# Debugging a hung server
+
+If the server accepts requests but handlers never complete (workers appear stuck), you can capture where each worker is blocked **without restarting** the process.
+
+## Capturing tracebacks from a live process
+
+1. Find worker PIDs (e.g. from the host):
+   ```bash
+   docker exec <lg-lite-container> ps -ef
+   ```
+   Workers are the `python -mLemonGraph.server` processes that are not the master (master is the one that forked; workers have different PIDs).
+
+2. Dump a traceback for a worker:
+   ```bash
+   docker exec <lg-lite-container> kill -USR1 <worker_pid>
+   ```
+   The server writes a traceback to `<data-dir>/debug-traceback.<pid>.txt` (and to stderr). With the default data volume this is under the `lg_lite_data` volume (e.g. inspect or `docker cp` from the container’s `/data`).
+
+3. Optional: dump all threads (if you use a Python build with faulthandler):
+   ```bash
+   docker exec <lg-lite-container> kill -USR2 <worker_pid>
+   ```
+   This prints a traceback for every thread to stderr.
+
+## Likely causes of “accepts but hangs”
+
+- **Write transaction held while streaming**  
+  Handlers that stream response bodies (e.g. task results) keep the graph’s **write** LMDB transaction open for the whole stream. Only one writer is allowed per graph (per process; LMDB coordinates across processes). So if worker A is streaming a response for job J and still holds the write txn, worker B trying to start a write txn on the same job (e.g. POST task result, or another adapter get_task) will block in LMDB until A finishes.
+
+- **File lock contention**  
+  Graph access is serialized per job UUID via a shared lock file. Long-running handlers that hold the lock (e.g. long streams or slow work) can cause other workers to block on `fcntl.lockf` for the same UUID.
+
+With only two workers, a few concurrent requests that mix streaming and writes on the same job can leave both workers blocked (one in the stream, one waiting on lock or write txn), so the server appears hung.

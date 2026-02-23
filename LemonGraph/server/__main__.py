@@ -203,6 +203,29 @@ def main():
     col = Collection(path, create=True, rebuild=rebuild, graph_opts=graph_opts, notls=notls)
     col.close()
 
+    # Debug: dump Python traceback on SIGUSR1 (e.g. when server appears hung).
+    # Workers inherit this; send kill -USR1 <worker_pid> to see where that process is stuck.
+    def _debug_traceback(signum, frame):
+        import traceback as _tb
+        lines = _tb.format_stack(frame)
+        msg = ''.join(["[SIGUSR1 traceback pid=%s]\n" % os.getpid()] + lines)
+        try:
+            with open(os.path.join(path, 'debug-traceback.%s.txt' % os.getpid()), 'w') as f:
+                f.write(msg)
+        except Exception:
+            pass
+        sys.stderr.write(msg)
+        sys.stderr.flush()
+    try:
+        signal.signal(signal.SIGUSR1, _debug_traceback)
+    except (ValueError, OSError):
+        pass  # not in main thread or signal not available
+    try:
+        import faulthandler
+        faulthandler.register(signal.SIGUSR2, file=sys.stderr, all_threads=True)
+    except Exception:
+        pass
+
     sd = syncd.Syncd(path)
 
     kwargs = dict(

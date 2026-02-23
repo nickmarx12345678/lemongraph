@@ -1236,6 +1236,10 @@ class _LG_Tasky(Handler, _Streamy):
         return task.status, chains
 
     def stream_job_task(self, job_uuid, priority=None, meta=None, touch=False, **kwargs):
+        # Separate data collection (write txn) from streaming (no locks held).
+        # Holding the LMDB write txn open across yield points blocks all other
+        # writers on the same graph for the full duration of the HTTP stream.
+        _collected = False
         with self.graph(job_uuid, create=False) as g:
             with g.transaction(write=True) as txn:
                 try:
@@ -1259,10 +1263,16 @@ class _LG_Tasky(Handler, _Streamy):
                             pass
                 if priority is not None:
                     self.res.headers.set('X-lg-priority', str(priority))
-                for chunk in self.stream([status], task.format()):
-                    yield chunk
-                return
-        raise IndexError
+                # Eagerly materialize all chain data before the write txn is
+                # committed, so we hold the write lock for the minimum time.
+                _chains = list(task.format())
+                _collected = True
+            # write txn committed and released here
+        # graph shared lock released here — yield with no locks held
+        if not _collected:
+            raise IndexError
+        for chunk in self.stream([status], _chains):
+            yield chunk
 
 class LG__Adapter(_Params, _LG_Tasky):
     path = ('lg', 'adapter', ADAPTER)

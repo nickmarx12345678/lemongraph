@@ -278,15 +278,18 @@ class Service(object):
         w = lib.lg_worker_new(wsock)
         byte = ffi.buffer(ffi.addressof(w, 'byte'), 1)
         go = True
+        pid = os.getpid()
+        log.info('worker(%d): ready, waiting for connections', pid)
         while go:
             r = lib.lg_worker_accept(w)
             if 0 == r:
+                log.info('worker(%d): accept returned 0, exiting', pid)
                 return
             elif -1 == r:
                 continue
             conn = BufferedSocket(socket.fromfd(w.conn, w.family, w.type, w.proto), byte[:])
             addr = conn.getpeername() or ('UNIX', 0)
-            log.debug('client %s:%d: connected', *addr)
+            log.info('worker(%d): client %s:%d connected', pid, *addr)
             try:
                 while go:
                     self.maxreqs -= 1
@@ -294,6 +297,8 @@ class Service(object):
                     try:
                         try:
                             req = Request(conn, res, timeout=self.timeout)
+                            started = time.time()
+                            log.info('worker(%d): %s %s from %s:%d', pid, req.method, req.path, *addr)
                             self.process(req, res)
                         except HTTPError as e:
                             if e.code >= 500:
@@ -304,28 +309,32 @@ class Service(object):
                     except ErrorCompleted:
                         pass
                     ended = time.time()
-                    log.debug('response/finished ms: %d/%d', res.delay_ms, int((ended - res.start) * 1000))
+                    elapsed_ms = int((ended - res.start) * 1000)
+                    log.info('worker(%d): %s %s completed in %d ms (response delay %d ms)',
+                        pid, req.method, req.path, elapsed_ms, res.delay_ms)
                     code = keepalive = 'HTTP/1.1' == req.version and not res.headers.contains('Connection', 'close')
                     if keepalive and conn:
                         continue
                     go = self.maxreqs > 0
                     if not go:
                         code |= 2
+                    log.info('worker(%d): finish(code=0x%x) keepalive=%s maxreqs=%d', pid, code, keepalive, self.maxreqs)
                     lib.lg_worker_finish(w, code)
                     break
             except Disconnected as e:
+                log.info('worker(%d): client %s:%d disconnected: %s', pid, *addr, e)
                 lib.lg_worker_finish(w, 0)
             except socket.timeout:
-                log.warning('client %s:%d: timed out', *addr)
+                log.warning('worker(%d): client %s:%d timed out', pid, *addr)
                 lib.lg_worker_finish(w, 0)
             except Exception as e:
                 info = sys.exc_info()
                 trace = ''.join(traceback.format_exception(*info))
-                log.error('Unhandled exception: %s', trace)
+                log.error('worker(%d): unhandled exception: %s', pid, trace)
                 os._exit(1)
             finally:
                 conn.close()
-                log.debug('client %s:%d: finished', *addr)
+                log.info('worker(%d): client %s:%d finished, returning to idle', pid, *addr)
 
     def process(self, req, res):
         cursor = self.root
